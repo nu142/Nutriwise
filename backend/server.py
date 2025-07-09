@@ -153,44 +153,80 @@ def create_rag_knowledge_base():
     for diet, info in NUTRITION_GUIDELINES["diet_compatibility"].items():
         knowledge_texts.append(f"For {diet} diet: {info['description']}")
     
-    if embedding_model:
-        embeddings = embedding_model.encode(knowledge_texts)
-        return {"texts": knowledge_texts, "embeddings": embeddings}
-    return None
+    # For now, return simple text-based knowledge base
+    return {"texts": knowledge_texts, "embeddings": None}
 
 def get_relevant_knowledge(query: str, top_k: int = 3):
-    """Retrieve relevant knowledge using RAG"""
-    if not rag_knowledge_base or not embedding_model:
+    """Retrieve relevant knowledge using simple text matching"""
+    if not rag_knowledge_base:
         return []
     
-    query_embedding = embedding_model.encode([query])
-    similarities = np.dot(rag_knowledge_base["embeddings"], query_embedding.T).flatten()
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    # Simple keyword matching for now
+    relevant_texts = []
+    query_lower = query.lower()
     
-    return [rag_knowledge_base["texts"][i] for i in top_indices]
+    for text in rag_knowledge_base["texts"]:
+        # Simple scoring based on keyword matches
+        if any(word in text.lower() for word in query_lower.split()):
+            relevant_texts.append(text)
+    
+    return relevant_texts[:top_k]
 
 def generate_llm_response(prompt: str, max_length: int = 200):
-    """Generate response using LLM or fallback to rule-based"""
-    if llm_model:
-        try:
-            response = llm_model(prompt, max_length=max_length, num_return_sequences=1)
-            return response[0]['generated_text']
-        except Exception as e:
-            print(f"LLM generation failed: {e}")
-    
-    # Fallback to rule-based response
+    """Generate response using rule-based system"""
+    # For now, use enhanced rule-based responses
     return generate_rule_based_response(prompt)
 
 def generate_rule_based_response(prompt: str):
-    """Fallback rule-based response generation"""
-    if "simplify" in prompt.lower() or "explain" in prompt.lower():
-        return "This nutrition label shows the basic nutritional content per serving."
-    elif "health goal" in prompt.lower():
-        return "This food may or may not align with your health goals depending on your specific needs."
-    elif "diet" in prompt.lower():
-        return "Please check if this food fits your dietary restrictions and preferences."
+    """Enhanced rule-based response generation"""
+    prompt_lower = prompt.lower()
+    
+    # Functionality 1: Simplification
+    if "simplify" in prompt_lower or "explain" in prompt_lower:
+        if "calories" in prompt_lower:
+            return "This nutrition label shows the caloric content and essential nutrients per serving. The calories indicate energy content, while other nutrients like protein, fats, and carbs provide building blocks for your body."
+        return "This nutrition label provides key information about the nutritional content of this food item, including macronutrients and micronutrients per serving."
+    
+    # Functionality 2: Health goals
+    elif "health goal" in prompt_lower or "weight loss" in prompt_lower:
+        if "weight loss" in prompt_lower:
+            return "For weight loss, focus on foods with moderate calories, high protein, and low added sugars. This food's nutritional profile should be evaluated against your daily calorie goals."
+        elif "muscle gain" in prompt_lower:
+            return "For muscle gain, prioritize foods high in protein and adequate calories. Look for lean protein sources and balanced macronutrients."
+        elif "heart health" in prompt_lower:
+            return "For heart health, choose foods low in sodium and saturated fats, with good fiber content. Monitor cholesterol intake."
+        elif "diabetes" in prompt_lower:
+            return "For diabetes management, focus on foods with low added sugars, high fiber, and complex carbohydrates to help manage blood sugar levels."
+        return "This food's suitability for your health goals depends on your specific nutritional needs and daily targets."
+    
+    # Functionality 3: Diet compatibility
+    elif "diet" in prompt_lower or "keto" in prompt_lower or "vegan" in prompt_lower:
+        if "keto" in prompt_lower:
+            return "For keto diet compatibility, check that this food is very low in carbohydrates (under 10g net carbs) and high in healthy fats."
+        elif "vegan" in prompt_lower:
+            return "For vegan diet compatibility, ensure this food contains no animal products, including no cholesterol and no animal-derived ingredients."
+        elif "paleo" in prompt_lower:
+            return "For paleo diet compatibility, this food should be minimally processed and contain no grains, legumes, or added sugars."
+        return "Diet compatibility depends on the specific restrictions and guidelines of your chosen dietary approach."
+    
+    # Functionality 4: Conversational
+    elif "?" in prompt_lower or "how" in prompt_lower or "what" in prompt_lower:
+        if "sodium" in prompt_lower:
+            return "Sodium content affects blood pressure and heart health. The recommended daily limit is 2,300mg for most adults."
+        elif "sugar" in prompt_lower:
+            return "Added sugars provide calories without essential nutrients. The daily limit is around 50g for most adults."
+        elif "protein" in prompt_lower:
+            return "Protein is essential for muscle maintenance and growth. Most adults need about 0.8g per kg of body weight daily."
+        elif "fat" in prompt_lower:
+            return "Fats provide essential fatty acids and fat-soluble vitamins. Focus on unsaturated fats and limit saturated fats."
+        return "I can help you understand any aspect of this nutrition information. Feel free to ask about specific nutrients or health implications."
+    
+    # Functionality 5: Warnings
+    elif "warning" in prompt_lower or "alert" in prompt_lower:
+        return "Based on the nutrition analysis, I can identify potential health concerns and suggest healthier alternatives to support your wellness goals."
+    
     else:
-        return "I can help you understand this nutrition information better."
+        return "I can help you understand this nutrition information, check diet compatibility, assess health goals, and provide personalized insights. What would you like to know?"
 
 @app.on_event("startup")
 async def startup_event():
