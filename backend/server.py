@@ -124,7 +124,7 @@ def initialize_models():
             "text2text-generation",
             model="google/flan-t5-small",
             torch_dtype=torch.float32,
-            device_map="cpu"
+            device=-1  # Use CPU
         )
         
         # Load sentence transformer for embeddings
