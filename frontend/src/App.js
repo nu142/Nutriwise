@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
 
-const API_BASE_URL = import.meta.env.REACT_APP_BACKEND_URL || process.env.REACT_APP_BACKEND_URL || 'http://localhost:8001';
+const API_BASE_URL = 'https://92e8a57e-565c-476f-a61a-306ae44bc398.preview.emergentagent.com';
 
 function App() {
   const [nutritionData, setNutritionData] = useState({
