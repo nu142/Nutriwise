@@ -3,10 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
-import numpy as np
-from sentence_transformers import SentenceTransformer
 import json
 
 app = FastAPI()
