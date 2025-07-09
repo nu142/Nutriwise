@@ -1,75 +1,584 @@
-from fastapi import FastAPI, APIRouter
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
-import uuid
-from datetime import datetime
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import json
 
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Create the main app without a prefix
 app = FastAPI()
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
-
-
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-# Include the router in the main app
-app.include_router(api_router)
-
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Global variables for models
+llm_model = None
+embedding_model = None
+rag_knowledge_base = None
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+class NutritionInput(BaseModel):
+    calories: float
+    total_fat: float
+    saturated_fat: float
+    trans_fat: float
+    cholesterol: float
+    sodium: float
+    total_carbs: float
+    dietary_fiber: float
+    total_sugars: float
+    added_sugars: float
+    protein: float
+    vitamin_d: Optional[float] = 0
+    calcium: Optional[float] = 0
+    iron: Optional[float] = 0
+    potassium: Optional[float] = 0
+    serving_size: Optional[str] = "1 serving"
+    food_name: Optional[str] = "Food Item"
+
+class HealthGoalInput(BaseModel):
+    nutrition_data: NutritionInput
+    health_goal: str  # "weight_loss", "muscle_gain", "heart_health", "diabetes_management"
+
+class DietCompatibilityInput(BaseModel):
+    nutrition_data: NutritionInput
+    diet_type: str  # "keto", "vegan", "paleo", "mediterranean", "low_sodium"
+
+class ConversationalInput(BaseModel):
+    nutrition_data: NutritionInput
+    question: str
+    context: Optional[str] = ""
+
+# RAG Knowledge Base
+NUTRITION_GUIDELINES = {
+    "daily_values": {
+        "calories": 2000,
+        "total_fat": 65,
+        "saturated_fat": 20,
+        "cholesterol": 300,
+        "sodium": 2300,
+        "total_carbs": 300,
+        "dietary_fiber": 25,
+        "protein": 50,
+        "added_sugars": 50
+    },
+    "health_goals": {
+        "weight_loss": {
+            "description": "Focus on low-calorie, high-fiber foods with moderate protein",
+            "limits": {"calories": 1500, "total_fat": 50, "added_sugars": 25}
+        },
+        "muscle_gain": {
+            "description": "High protein intake with balanced carbs and healthy fats",
+            "targets": {"protein": 80, "calories": 2500}
+        },
+        "heart_health": {
+            "description": "Low sodium, low saturated fat, high fiber",
+            "limits": {"sodium": 1500, "saturated_fat": 13}
+        },
+        "diabetes_management": {
+            "description": "Low added sugars, high fiber, moderate carbs",
+            "limits": {"added_sugars": 25, "total_carbs": 200}
+        }
+    },
+    "diet_compatibility": {
+        "keto": {
+            "description": "Very low carb, high fat, moderate protein",
+            "limits": {"total_carbs": 30, "net_carbs": 20},
+            "targets": {"total_fat": 70}
+        },
+        "vegan": {
+            "description": "Plant-based diet, no animal products",
+            "restrictions": ["cholesterol", "animal_fats"]
+        },
+        "paleo": {
+            "description": "Whole foods, no processed ingredients",
+            "avoid": ["added_sugars", "processed_foods"]
+        },
+        "mediterranean": {
+            "description": "Healthy fats, moderate carbs, lean proteins",
+            "encourage": ["healthy_fats", "fiber", "moderate_sodium"]
+        },
+        "low_sodium": {
+            "description": "Reduced sodium intake for heart health",
+            "limits": {"sodium": 1500}
+        }
+    }
+}
+
+def initialize_models():
+    """Initialize LLM and embedding models"""
+    global llm_model, embedding_model, rag_knowledge_base
+    
+    try:
+        # Use a lightweight T5 model for text generation
+        print("Loading T5 model...")
+        llm_model = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-small",
+            torch_dtype=torch.float32,
+            device_map="cpu"
+        )
+        
+        # Load sentence transformer for embeddings
+        print("Loading embedding model...")
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Create knowledge base embeddings
+        print("Creating RAG knowledge base...")
+        rag_knowledge_base = create_rag_knowledge_base()
+        
+        print("Models initialized successfully!")
+        
+    except Exception as e:
+        print(f"Error initializing models: {e}")
+        # Fallback to a simple rule-based system if models fail
+        llm_model = None
+        embedding_model = None
+
+def create_rag_knowledge_base():
+    """Create embeddings for nutrition guidelines"""
+    knowledge_texts = []
+    
+    # Daily values information
+    for nutrient, value in NUTRITION_GUIDELINES["daily_values"].items():
+        knowledge_texts.append(f"The daily value for {nutrient} is {value}")
+    
+    # Health goals information
+    for goal, info in NUTRITION_GUIDELINES["health_goals"].items():
+        knowledge_texts.append(f"For {goal}: {info['description']}")
+    
+    # Diet compatibility information
+    for diet, info in NUTRITION_GUIDELINES["diet_compatibility"].items():
+        knowledge_texts.append(f"For {diet} diet: {info['description']}")
+    
+    if embedding_model:
+        embeddings = embedding_model.encode(knowledge_texts)
+        return {"texts": knowledge_texts, "embeddings": embeddings}
+    return None
+
+def get_relevant_knowledge(query: str, top_k: int = 3):
+    """Retrieve relevant knowledge using RAG"""
+    if not rag_knowledge_base or not embedding_model:
+        return []
+    
+    query_embedding = embedding_model.encode([query])
+    similarities = np.dot(rag_knowledge_base["embeddings"], query_embedding.T).flatten()
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    
+    return [rag_knowledge_base["texts"][i] for i in top_indices]
+
+def generate_llm_response(prompt: str, max_length: int = 200):
+    """Generate response using LLM or fallback to rule-based"""
+    if llm_model:
+        try:
+            response = llm_model(prompt, max_length=max_length, num_return_sequences=1)
+            return response[0]['generated_text']
+        except Exception as e:
+            print(f"LLM generation failed: {e}")
+    
+    # Fallback to rule-based response
+    return generate_rule_based_response(prompt)
+
+def generate_rule_based_response(prompt: str):
+    """Fallback rule-based response generation"""
+    if "simplify" in prompt.lower() or "explain" in prompt.lower():
+        return "This nutrition label shows the basic nutritional content per serving."
+    elif "health goal" in prompt.lower():
+        return "This food may or may not align with your health goals depending on your specific needs."
+    elif "diet" in prompt.lower():
+        return "Please check if this food fits your dietary restrictions and preferences."
+    else:
+        return "I can help you understand this nutrition information better."
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize models on startup"""
+    initialize_models()
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "models_loaded": llm_model is not None}
+
+@app.post("/api/nutrition/simplify")
+async def simplify_nutrition_label(nutrition: NutritionInput):
+    """Functionality 1: Nutritional Label Simplification"""
+    try:
+        # Get relevant knowledge
+        query = f"explain nutrition label with {nutrition.calories} calories"
+        relevant_knowledge = get_relevant_knowledge(query)
+        
+        # Create prompt
+        prompt = f"""
+        Simplify this nutrition label for easy understanding:
+        
+        Food: {nutrition.food_name}
+        Serving Size: {nutrition.serving_size}
+        Calories: {nutrition.calories}
+        Total Fat: {nutrition.total_fat}g
+        Saturated Fat: {nutrition.saturated_fat}g
+        Cholesterol: {nutrition.cholesterol}mg
+        Sodium: {nutrition.sodium}mg
+        Total Carbohydrates: {nutrition.total_carbs}g
+        Dietary Fiber: {nutrition.dietary_fiber}g
+        Total Sugars: {nutrition.total_sugars}g
+        Added Sugars: {nutrition.added_sugars}g
+        Protein: {nutrition.protein}g
+        
+        Context: {' '.join(relevant_knowledge)}
+        
+        Provide a simple, friendly explanation of what these numbers mean:
+        """
+        
+        response = generate_llm_response(prompt)
+        
+        # Calculate daily value percentages
+        daily_values = NUTRITION_GUIDELINES["daily_values"]
+        percentages = {}
+        for nutrient in ["calories", "total_fat", "saturated_fat", "cholesterol", "sodium", "total_carbs", "dietary_fiber", "protein"]:
+            if hasattr(nutrition, nutrient) and nutrient in daily_values:
+                value = getattr(nutrition, nutrient)
+                percentages[nutrient] = round((value / daily_values[nutrient]) * 100, 1)
+        
+        return {
+            "simplified_explanation": response,
+            "daily_value_percentages": percentages,
+            "key_insights": [
+                f"This serving contains {nutrition.calories} calories",
+                f"Provides {nutrition.protein}g of protein",
+                f"Contains {nutrition.total_fat}g of fat",
+                f"Has {nutrition.added_sugars}g of added sugars"
+            ]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing nutrition label: {str(e)}")
+
+@app.post("/api/nutrition/health-goal")
+async def check_health_goal_suitability(goal_input: HealthGoalInput):
+    """Functionality 2: Health Goal Suitability"""
+    try:
+        nutrition = goal_input.nutrition_data
+        health_goal = goal_input.health_goal
+        
+        # Get relevant knowledge
+        query = f"health goal {health_goal} nutrition suitability"
+        relevant_knowledge = get_relevant_knowledge(query)
+        
+        # Get goal-specific guidelines
+        goal_info = NUTRITION_GUIDELINES["health_goals"].get(health_goal, {})
+        
+        # Create prompt
+        prompt = f"""
+        Analyze if this food is suitable for the health goal: {health_goal}
+        
+        Nutrition Information:
+        Calories: {nutrition.calories}
+        Total Fat: {nutrition.total_fat}g
+        Saturated Fat: {nutrition.saturated_fat}g
+        Sodium: {nutrition.sodium}mg
+        Added Sugars: {nutrition.added_sugars}g
+        Protein: {nutrition.protein}g
+        Fiber: {nutrition.dietary_fiber}g
+        
+        Health Goal: {health_goal}
+        Goal Description: {goal_info.get('description', '')}
+        
+        Context: {' '.join(relevant_knowledge)}
+        
+        Provide a clear verdict on whether this food aligns with the health goal:
+        """
+        
+        response = generate_llm_response(prompt)
+        
+        # Rule-based evaluation
+        suitability_score = calculate_health_goal_score(nutrition, health_goal)
+        
+        return {
+            "health_goal": health_goal,
+            "suitability_verdict": response,
+            "suitability_score": suitability_score,
+            "recommendation": get_health_goal_recommendation(suitability_score),
+            "goal_info": goal_info
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing health goal suitability: {str(e)}")
+
+@app.post("/api/nutrition/diet-compatibility")
+async def check_diet_compatibility(diet_input: DietCompatibilityInput):
+    """Functionality 3: Diet Compatibility Checker"""
+    try:
+        nutrition = diet_input.nutrition_data
+        diet_type = diet_input.diet_type
+        
+        # Get relevant knowledge
+        query = f"diet compatibility {diet_type} nutrition"
+        relevant_knowledge = get_relevant_knowledge(query)
+        
+        # Get diet-specific guidelines
+        diet_info = NUTRITION_GUIDELINES["diet_compatibility"].get(diet_type, {})
+        
+        # Create prompt
+        prompt = f"""
+        Check if this food is compatible with the {diet_type} diet:
+        
+        Nutrition Information:
+        Calories: {nutrition.calories}
+        Total Fat: {nutrition.total_fat}g
+        Total Carbs: {nutrition.total_carbs}g
+        Dietary Fiber: {nutrition.dietary_fiber}g
+        Protein: {nutrition.protein}g
+        Sodium: {nutrition.sodium}mg
+        Added Sugars: {nutrition.added_sugars}g
+        
+        Diet Type: {diet_type}
+        Diet Description: {diet_info.get('description', '')}
+        
+        Context: {' '.join(relevant_knowledge)}
+        
+        Explain the compatibility with reasoning:
+        """
+        
+        response = generate_llm_response(prompt)
+        
+        # Rule-based compatibility check
+        compatibility_score = calculate_diet_compatibility_score(nutrition, diet_type)
+        
+        return {
+            "diet_type": diet_type,
+            "compatibility_explanation": response,
+            "compatibility_score": compatibility_score,
+            "is_compatible": compatibility_score >= 70,
+            "diet_info": diet_info,
+            "specific_concerns": get_diet_specific_concerns(nutrition, diet_type)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error checking diet compatibility: {str(e)}")
+
+@app.post("/api/nutrition/chat")
+async def conversational_assistant(chat_input: ConversationalInput):
+    """Functionality 4: Conversational Query Assistant"""
+    try:
+        nutrition = chat_input.nutrition_data
+        question = chat_input.question
+        context = chat_input.context
+        
+        # Get relevant knowledge
+        relevant_knowledge = get_relevant_knowledge(question)
+        
+        # Create prompt
+        prompt = f"""
+        Answer this question about the nutrition information:
+        
+        Question: {question}
+        
+        Nutrition Information:
+        Food: {nutrition.food_name}
+        Calories: {nutrition.calories}
+        Total Fat: {nutrition.total_fat}g
+        Saturated Fat: {nutrition.saturated_fat}g
+        Cholesterol: {nutrition.cholesterol}mg
+        Sodium: {nutrition.sodium}mg
+        Total Carbs: {nutrition.total_carbs}g
+        Dietary Fiber: {nutrition.dietary_fiber}g
+        Total Sugars: {nutrition.total_sugars}g
+        Added Sugars: {nutrition.added_sugars}g
+        Protein: {nutrition.protein}g
+        
+        Context: {context}
+        Knowledge: {' '.join(relevant_knowledge)}
+        
+        Provide a helpful, conversational answer:
+        """
+        
+        response = generate_llm_response(prompt)
+        
+        return {
+            "question": question,
+            "answer": response,
+            "relevant_facts": relevant_knowledge[:2],
+            "follow_up_suggestions": [
+                "How does this compare to daily recommended values?",
+                "What are the health implications of these nutrients?",
+                "Are there any concerns with this food item?"
+            ]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error in conversational assistant: {str(e)}")
+
+@app.post("/api/nutrition/warnings")
+async def generate_warnings_and_suggestions(nutrition: NutritionInput):
+    """Functionality 5: Smart Warnings and Suggestions"""
+    try:
+        # Get relevant knowledge
+        query = f"nutrition warnings health alerts {nutrition.food_name}"
+        relevant_knowledge = get_relevant_knowledge(query)
+        
+        # Create prompt
+        prompt = f"""
+        Analyze this nutrition label for health warnings and provide suggestions:
+        
+        Food: {nutrition.food_name}
+        Calories: {nutrition.calories}
+        Total Fat: {nutrition.total_fat}g
+        Saturated Fat: {nutrition.saturated_fat}g
+        Sodium: {nutrition.sodium}mg
+        Added Sugars: {nutrition.added_sugars}g
+        Protein: {nutrition.protein}g
+        
+        Context: {' '.join(relevant_knowledge)}
+        
+        Provide health warnings and alternative suggestions:
+        """
+        
+        response = generate_llm_response(prompt)
+        
+        # Rule-based warnings
+        warnings = generate_health_warnings(nutrition)
+        suggestions = generate_healthy_alternatives(nutrition)
+        
+        return {
+            "ai_analysis": response,
+            "health_warnings": warnings,
+            "alternative_suggestions": suggestions,
+            "overall_health_score": calculate_overall_health_score(nutrition),
+            "improvement_tips": get_improvement_tips(nutrition)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating warnings: {str(e)}")
+
+# Helper functions
+def calculate_health_goal_score(nutrition: NutritionInput, health_goal: str) -> int:
+    """Calculate suitability score for health goals"""
+    score = 50  # Base score
+    
+    if health_goal == "weight_loss":
+        if nutrition.calories < 300: score += 20
+        if nutrition.total_fat < 10: score += 15
+        if nutrition.added_sugars < 5: score += 15
+    elif health_goal == "muscle_gain":
+        if nutrition.protein > 15: score += 25
+        if nutrition.calories > 200: score += 15
+    elif health_goal == "heart_health":
+        if nutrition.sodium < 400: score += 20
+        if nutrition.saturated_fat < 3: score += 20
+        if nutrition.dietary_fiber > 5: score += 10
+    elif health_goal == "diabetes_management":
+        if nutrition.added_sugars < 3: score += 25
+        if nutrition.dietary_fiber > 5: score += 15
+    
+    return min(100, max(0, score))
+
+def calculate_diet_compatibility_score(nutrition: NutritionInput, diet_type: str) -> int:
+    """Calculate compatibility score for diets"""
+    score = 50  # Base score
+    
+    if diet_type == "keto":
+        net_carbs = nutrition.total_carbs - nutrition.dietary_fiber
+        if net_carbs < 5: score += 30
+        if nutrition.total_fat > 15: score += 20
+    elif diet_type == "low_sodium":
+        if nutrition.sodium < 300: score += 30
+        if nutrition.sodium < 150: score += 20
+    elif diet_type == "vegan":
+        if nutrition.cholesterol == 0: score += 25
+        score += 25  # Assume plant-based if no cholesterol
+    
+    return min(100, max(0, score))
+
+def calculate_overall_health_score(nutrition: NutritionInput) -> int:
+    """Calculate overall health score"""
+    score = 50
+    daily_values = NUTRITION_GUIDELINES["daily_values"]
+    
+    # Positive factors
+    if nutrition.dietary_fiber > 5: score += 15
+    if nutrition.protein > 10: score += 10
+    
+    # Negative factors
+    if nutrition.added_sugars > daily_values["added_sugars"] * 0.2: score -= 15
+    if nutrition.sodium > daily_values["sodium"] * 0.3: score -= 15
+    if nutrition.saturated_fat > daily_values["saturated_fat"] * 0.3: score -= 10
+    
+    return min(100, max(0, score))
+
+def get_health_goal_recommendation(score: int) -> str:
+    """Get recommendation based on health goal score"""
+    if score >= 80: return "Excellent choice for your health goal!"
+    elif score >= 60: return "Good option with minor considerations"
+    elif score >= 40: return "Okay choice, but could be better"
+    else: return "Consider healthier alternatives"
+
+def get_diet_specific_concerns(nutrition: NutritionInput, diet_type: str) -> List[str]:
+    """Get specific concerns for diet types"""
+    concerns = []
+    
+    if diet_type == "keto":
+        net_carbs = nutrition.total_carbs - nutrition.dietary_fiber
+        if net_carbs > 10: concerns.append(f"High net carbs: {net_carbs}g")
+    elif diet_type == "low_sodium":
+        if nutrition.sodium > 400: concerns.append(f"High sodium: {nutrition.sodium}mg")
+    elif diet_type == "vegan":
+        if nutrition.cholesterol > 0: concerns.append("Contains cholesterol (not vegan)")
+    
+    return concerns
+
+def generate_health_warnings(nutrition: NutritionInput) -> List[str]:
+    """Generate health warnings based on nutrition values"""
+    warnings = []
+    daily_values = NUTRITION_GUIDELINES["daily_values"]
+    
+    if nutrition.sodium > daily_values["sodium"] * 0.4:
+        warnings.append("⚠️ High sodium content - may affect blood pressure")
+    if nutrition.added_sugars > daily_values["added_sugars"] * 0.3:
+        warnings.append("⚠️ High added sugars - may cause blood sugar spikes")
+    if nutrition.saturated_fat > daily_values["saturated_fat"] * 0.4:
+        warnings.append("⚠️ High saturated fat - may impact heart health")
+    if nutrition.calories > 500:
+        warnings.append("⚠️ High calorie content - consume in moderation")
+    
+    return warnings
+
+def generate_healthy_alternatives(nutrition: NutritionInput) -> List[str]:
+    """Generate healthy alternative suggestions"""
+    suggestions = []
+    
+    if nutrition.added_sugars > 10:
+        suggestions.append("🍎 Try fresh fruits instead of processed sweets")
+    if nutrition.sodium > 600:
+        suggestions.append("🥗 Look for low-sodium versions or fresh alternatives")
+    if nutrition.saturated_fat > 10:
+        suggestions.append("🥑 Consider foods with healthy fats like avocados or nuts")
+    if nutrition.dietary_fiber < 3:
+        suggestions.append("🌾 Add more fiber-rich foods like whole grains")
+    
+    return suggestions
+
+def get_improvement_tips(nutrition: NutritionInput) -> List[str]:
+    """Get tips for improving nutrition"""
+    tips = []
+    
+    if nutrition.protein < 10:
+        tips.append("💪 Add more protein sources to your meal")
+    if nutrition.dietary_fiber < 5:
+        tips.append("🌿 Include more vegetables and whole grains")
+    if nutrition.added_sugars > 15:
+        tips.append("🍯 Try natural sweeteners instead of added sugars")
+    
+    return tips
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
